@@ -1,33 +1,39 @@
 """
-SHL Catalog Embedding Pipeline  —  v4 (fastembed ONNX)
--------------------------------------------------------
-Embedder: fastembed TextEmbedding BAAI/bge-small-en-v1.5
-  • 33MB ONNX model, 384-dim
-  • No PyTorch, no API calls, no geographic restrictions
-  • ~100MB total memory on Render free tier
+SHL Catalog Embedding Pipeline  —  Gemini embedding-001
+--------------------------------------------------------
+Embedder: models/gemini-embedding-001  (3072-dim, Gemini API)
 
-Run once (or after re-downloading the catalog):
+Run once:
     python build_index.py
 
 Output:
-    shl_index.faiss        — FAISS IndexFlatIP (384-dim, 377 vectors)
+    shl_index.faiss        — FAISS IndexFlatIP (3072-dim)
     shl_index_meta.json    — parallel metadata list
 """
 
 import json
+import os
 import sys
+import time
+import re
 import numpy as np
 import faiss
 from pathlib import Path
-from fastembed import TextEmbedding
+from dotenv import load_dotenv
 
+load_dotenv()
 sys.stdout.reconfigure(encoding="utf-8")
+
+from google import genai
+from google.genai import types as _gt
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CATALOG_PATH = "shl_official_catalog.json"
 INDEX_PATH   = "shl_index.faiss"
 META_PATH    = "shl_index_meta.json"
-EMBED_MODEL  = "BAAI/bge-small-en-v1.5"   # 384-dim ONNX
+EMBED_MODEL  = "models/gemini-embedding-001"
+BATCH_SIZE   = 5     # stay under 100 RPM free-tier limit
+SLEEP_BATCH  = 4.0   # seconds between batches
 
 LABEL_TO_CODE = {
     "Ability & Aptitude":             "A",
@@ -51,17 +57,16 @@ def build_text_chunk(item: dict) -> str:
     remote      = item.get("remote", "no")
     adaptive    = item.get("adaptive", "no")
     url         = item.get("link", item.get("url", "")).strip()
-
-    type_codes = [LABEL_TO_CODE.get(k, k[0]) for k in keys]
+    type_codes  = [LABEL_TO_CODE.get(k, k[0]) for k in keys]
 
     lines = [
         f"Assessment: {name}",
-        f"Description: {description}"             if description  else "",
-        f"Test type: {', '.join(keys)}"           if keys         else "",
-        f"Type codes: {', '.join(type_codes)}"    if type_codes   else "",
-        f"Job levels: {', '.join(job_levels)}"    if job_levels   else "",
-        f"Duration: {duration}"                   if duration     else "",
-        f"Languages: {', '.join(languages)}"      if languages    else "",
+        f"Description: {description}"          if description else "",
+        f"Test type: {', '.join(keys)}"        if keys        else "",
+        f"Type codes: {', '.join(type_codes)}" if type_codes  else "",
+        f"Job levels: {', '.join(job_levels)}" if job_levels  else "",
+        f"Duration: {duration}"                if duration    else "",
+        f"Languages: {', '.join(languages)}"   if languages   else "",
         f"Remote testing: {remote}",
         f"Adaptive/IRT: {adaptive}",
         f"URL: {url}",
@@ -73,7 +78,6 @@ def build_meta_record(item: dict) -> dict:
     keys       = item.get("keys", [])
     type_codes = [LABEL_TO_CODE.get(k, k[0]) for k in keys]
     url        = item.get("link", item.get("url", ""))
-
     return {
         "name":            item.get("name", ""),
         "url":             url,
@@ -88,65 +92,83 @@ def build_meta_record(item: dict) -> dict:
     }
 
 
+def embed_texts(client, texts: list[str]) -> np.ndarray:
+    all_embeddings = []
+    total_batches  = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for b_idx in range(total_batches):
+        batch = texts[b_idx * BATCH_SIZE : (b_idx + 1) * BATCH_SIZE]
+        print(f"  Batch {b_idx+1}/{total_batches} ({len(batch)} items)...", end=" ", flush=True)
+
+        for attempt in range(5):
+            try:
+                response = client.models.embed_content(model=EMBED_MODEL, contents=batch)
+                vecs = [e.values for e in response.embeddings]
+                all_embeddings.extend(vecs)
+                print(f"OK (dim={len(vecs[0])})")
+                break
+            except Exception as exc:
+                wait = 20
+                m = re.search(r"retry in (\d+)", str(exc))
+                if m:
+                    wait = int(m.group(1)) + 2
+                print(f"\n  [WARN] attempt {attempt+1} failed (waiting {wait}s): {exc}")
+                if attempt == 4:
+                    raise
+                time.sleep(wait)
+
+        if b_idx < total_batches - 1:
+            time.sleep(SLEEP_BATCH)
+
+    arr = np.array(all_embeddings, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return arr / norms
+
+
 def main():
-    # 1. Load catalog
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        sys.exit("ERROR: GEMINI_API_KEY not set.")
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=_gt.HttpOptions(api_version="v1"),
+    )
+
     print(f"Loading catalog from '{CATALOG_PATH}' ...")
     with open(CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
     print(f"  {len(catalog)} assessments loaded.")
 
-    # 2. Build text chunks
-    print("\nBuilding text chunks ...")
     chunks = [build_text_chunk(item) for item in catalog]
+    print(f"\nEmbedding {len(chunks)} chunks via Gemini '{EMBED_MODEL}' ...")
+    embeddings = embed_texts(client, chunks)
+    print(f"Embedding matrix: {embeddings.shape}")
 
-    # 3. Embed via fastembed (local ONNX, no API calls)
-    print(f"\nLoading fastembed model '{EMBED_MODEL}' ...")
-    embedder = TextEmbedding(EMBED_MODEL)
-
-    print("Embedding all chunks (local ONNX, no rate limits)...")
-    raw = list(embedder.embed(chunks))
-    embeddings = np.array(raw, dtype=np.float32)
-
-    # L2-normalise for cosine similarity via dot product
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    embeddings = embeddings / norms
-    print(f"Embedding matrix: {embeddings.shape}")   # expected (377, 384)
-
-    # 4. Build FAISS index
-    print("\nBuilding FAISS IndexFlatIP ...")
     dim   = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
-    print(f"  {index.ntotal} vectors indexed (dim={dim}).")
+    print(f"\nFAISS index: {index.ntotal} vectors, dim={dim}")
 
-    # 5. Save
     faiss.write_index(index, INDEX_PATH)
-    print(f"  FAISS index saved -> {INDEX_PATH}")
-
     meta = [build_meta_record(item) for item in catalog]
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
-    print(f"  Metadata saved -> {META_PATH}")
+    print(f"Saved: {INDEX_PATH}, {META_PATH}")
 
-    # 6. Smoke test
-    print("\n-- Quick retrieval smoke-test --")
-    test_queries = [
-        "Java developer mid level coding and personality",
-        "personality assessment for senior sales rep",
-        "cognitive ability numerical reasoning graduate",
-        "adaptive deductive reasoning",
-    ]
-    for query in test_queries:
-        q_vec = np.array(list(embedder.embed([query]))[0], dtype=np.float32)
-        q_vec = (q_vec / np.linalg.norm(q_vec)).reshape(1, -1)
-        scores, idxs = index.search(q_vec, k=3)
-        print(f"\nQuery: '{query}'")
-        for rank, (score, idx) in enumerate(zip(scores[0], idxs[0]), 1):
-            m = meta[idx]
-            print(f"  {rank}. [{score:.3f}]  {m['name']}  |  {', '.join(m['test_types'])}")
+    # Smoke test
+    print("\n-- Smoke test --")
+    for query in ["Java developer coding", "personality sales rep", "numerical reasoning graduate"]:
+        r = client.models.embed_content(model=EMBED_MODEL, contents=query)
+        q = np.array(r.embeddings[0].values, dtype=np.float32)
+        q = (q / np.linalg.norm(q)).reshape(1, -1)
+        scores, idxs = index.search(q, 3)
+        print(f"\n'{query}'")
+        for score, idx in zip(scores[0], idxs[0]):
+            print(f"  [{score:.3f}] {meta[idx]['name']}")
 
-    print("\nIndex build complete.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
