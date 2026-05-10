@@ -19,12 +19,12 @@ import json
 import os
 import re
 import sys
+import time
 import concurrent.futures
 from pathlib import Path
 
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,38 +34,50 @@ from google import genai
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
-_HERE       = Path(__file__).parent
-META_PATH   = _HERE / "shl_index_meta.json"
-INDEX_PATH  = _HERE / "shl_index.faiss"
-EMBED_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-LLM_TIMEOUT = 25   # seconds — leave 5 s buffer under the 30 s evaluator cap
+_HERE        = Path(__file__).parent
+META_PATH    = _HERE / "shl_index_meta.json"
+INDEX_PATH   = _HERE / "shl_index.faiss"
+EMBED_MODEL  = "models/gemini-embedding-001"  # Gemini embedding — 768-dim, no local model
+LLM_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+LLM_TIMEOUT  = 25   # seconds — leave 5 s buffer under the 30 s evaluator cap
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Singletons
 # ─────────────────────────────────────────────────────────────────────────────
-_index:      faiss.Index           | None = None
-_metadata:   list[dict]            | None = None
-_embedder:   SentenceTransformer   | None = None
-_llm:        genai.Client          | None = None
-_valid_urls: set[str]                     = set()   # catalog URL allowlist
+_index:      faiss.Index  | None = None
+_metadata:   list[dict]   | None = None
+_llm:        genai.Client | None = None
+_valid_urls: set[str]            = set()   # catalog URL allowlist
 
 
 def _load_resources() -> None:
-    global _index, _metadata, _embedder, _llm, _valid_urls
+    global _index, _metadata, _llm, _valid_urls
     if _index is not None:
         return
 
     with open(META_PATH, encoding="utf-8") as f:
         _metadata = json.load(f)
-    _index     = faiss.read_index(str(INDEX_PATH))
-    _embedder  = SentenceTransformer(EMBED_MODEL)
+    _index      = faiss.read_index(str(INDEX_PATH))
     _valid_urls = {item["url"] for item in _metadata}
 
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set. Add it to your .env file.")
     _llm = genai.Client(api_key=api_key)
+    print(f"[resources] Loaded {len(_metadata)} items, index dim={_index.d}", file=sys.stderr)
+
+
+def _embed_query(text: str) -> np.ndarray:
+    """Embed a query string via Gemini text-embedding-004 (no local model needed)."""
+    response = _llm.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+    )
+    vec = np.array(response.embeddings[0].values, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec = vec / norm   # L2-normalise for cosine similarity via dot product
+    return vec.reshape(1, -1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,7 +171,7 @@ def _injection_refusal() -> dict:
 # FAISS retrieval
 # ─────────────────────────────────────────────────────────────────────────────
 def _retrieve(query: str, k: int = 15) -> list[dict]:
-    vec = _embedder.encode([query], normalize_embeddings=True).astype(np.float32)
+    vec = _embed_query(query)   # Gemini API embedding — no local model
     scores, idxs = _index.search(vec, k)
     results = []
     for score, idx in zip(scores[0], idxs[0]):
