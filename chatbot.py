@@ -44,14 +44,15 @@ LLM_TIMEOUT  = 25
 # ─────────────────────────────────────────────────────────────────────────────
 # Singletons
 # ─────────────────────────────────────────────────────────────────────────────
-_index:      faiss.Index  | None = None
-_metadata:   list[dict]   | None = None
-_llm:        genai.Client | None = None
-_valid_urls: set[str]            = set()
+_index:        faiss.Index  | None = None
+_metadata:     list[dict]   | None = None
+_llm:          genai.Client | None = None   # v1  — generation
+_embed_client: genai.Client | None = None   # v1beta — gemini-embedding-001
+_valid_urls:   set[str]            = set()
 
 
 def _load_resources() -> None:
-    global _index, _metadata, _llm, _valid_urls
+    global _index, _metadata, _llm, _embed_client, _valid_urls
     if _index is not None:
         return
 
@@ -63,17 +64,21 @@ def _load_resources() -> None:
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set.")
+
     from google.genai import types as _gt
+    # v1 for generation (more stable across regions)
     _llm = genai.Client(
         api_key=api_key,
         http_options=_gt.HttpOptions(api_version="v1"),
     )
+    # v1beta for embedding (gemini-embedding-001 is only on v1beta)
+    _embed_client = genai.Client(api_key=api_key)
     print(f"[resources] Ready — {len(_metadata)} items, index dim={_index.d}", file=sys.stderr)
 
 
 def _embed_query(text: str) -> np.ndarray:
-    """Embed query via Gemini embedding API."""
-    response = _llm.models.embed_content(model=EMBED_MODEL, contents=text)
+    """Embed query via Gemini embedding API (v1beta)."""
+    response = _embed_client.models.embed_content(model=EMBED_MODEL, contents=text)
     vec = np.array(response.embeddings[0].values, dtype=np.float32)
     norm = np.linalg.norm(vec)
     if norm > 0:

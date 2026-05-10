@@ -131,10 +131,7 @@ def main():
     if not api_key:
         sys.exit("ERROR: GEMINI_API_KEY not set.")
 
-    client = genai.Client(
-        api_key=api_key,
-        http_options=_gt.HttpOptions(api_version="v1"),
-    )
+    client = genai.Client(api_key=api_key)   # default v1beta — embedding model requires it
 
     print(f"Loading catalog from '{CATALOG_PATH}' ...")
     with open(CATALOG_PATH, encoding="utf-8") as f:
