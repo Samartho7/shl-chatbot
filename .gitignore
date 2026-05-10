@@ -1,0 +1,30 @@
+# Environment secrets — NEVER commit
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Test artifacts
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Keep these — required at runtime:
+# shl_index.faiss
+# shl_index_meta.json
+# shl_official_catalog.json
