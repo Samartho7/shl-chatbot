@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import faiss
+from fastembed import TextEmbedding
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,21 +38,22 @@ from google import genai
 _HERE        = Path(__file__).parent
 META_PATH    = _HERE / "shl_index_meta.json"
 INDEX_PATH   = _HERE / "shl_index.faiss"
-EMBED_MODEL  = "models/gemini-embedding-001"  # Gemini embedding — 768-dim, no local model
+EMBED_MODEL  = "BAAI/bge-small-en-v1.5"   # 384-dim local ONNX, no API calls
 LLM_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LLM_TIMEOUT  = 25   # seconds — leave 5 s buffer under the 30 s evaluator cap
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Singletons
 # ─────────────────────────────────────────────────────────────────────────────
-_index:      faiss.Index  | None = None
-_metadata:   list[dict]   | None = None
-_llm:        genai.Client | None = None
-_valid_urls: set[str]            = set()   # catalog URL allowlist
+_index:      faiss.Index    | None = None
+_metadata:   list[dict]     | None = None
+_embedder:   TextEmbedding  | None = None   # fastembed local ONNX
+_llm:        genai.Client   | None = None   # Gemini — generation only
+_valid_urls: set[str]               = set()
 
 
 def _load_resources() -> None:
-    global _index, _metadata, _llm, _valid_urls
+    global _index, _metadata, _embedder, _llm, _valid_urls
     if _index is not None:
         return
 
@@ -60,28 +62,28 @@ def _load_resources() -> None:
     _index      = faiss.read_index(str(INDEX_PATH))
     _valid_urls = {item["url"] for item in _metadata}
 
+    # Load local ONNX embedding model (no API key, no geographic restrictions)
+    print(f"[resources] Loading fastembed model '{EMBED_MODEL}' ...", file=sys.stderr)
+    _embedder = TextEmbedding(EMBED_MODEL)
+
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set. Add it to your .env file.")
-    # Force stable v1 endpoint — avoids 'User location not supported' on some cloud IPs
+    # Force stable v1 endpoint
     from google.genai import types as _gt
     _llm = genai.Client(
         api_key=api_key,
         http_options=_gt.HttpOptions(api_version="v1"),
     )
-    print(f"[resources] Loaded {len(_metadata)} items, index dim={_index.d}", file=sys.stderr)
+    print(f"[resources] Ready — {len(_metadata)} items, index dim={_index.d}", file=sys.stderr)
 
 
 def _embed_query(text: str) -> np.ndarray:
-    """Embed a query string via Gemini text-embedding-004 (no local model needed)."""
-    response = _llm.models.embed_content(
-        model=EMBED_MODEL,
-        contents=text,
-    )
-    vec = np.array(response.embeddings[0].values, dtype=np.float32)
+    """Embed a query string locally via fastembed ONNX (no API call)."""
+    vec = np.array(list(_embedder.embed([text]))[0], dtype=np.float32)
     norm = np.linalg.norm(vec)
     if norm > 0:
-        vec = vec / norm   # L2-normalise for cosine similarity via dot product
+        vec = vec / norm
     return vec.reshape(1, -1)
 
 

@@ -3,11 +3,12 @@ fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 pydantic>=2.6.0
 
-# ML / Retrieval  (no sentence-transformers — uses Gemini embedding API instead)
+# ML / Retrieval  (fastembed = local ONNX, no PyTorch, no API calls, ~100MB)
+fastembed>=0.3.0
 faiss-cpu>=1.7.4
 numpy>=1.24.0
 
-# LLM + Embeddings (single API for both generation and embedding)
+# LLM (Gemini for generation only — not used for embeddings)
 google-genai>=2.0.0
 
 # Utilities
