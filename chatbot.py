@@ -63,7 +63,12 @@ def _load_resources() -> None:
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set. Add it to your .env file.")
-    _llm = genai.Client(api_key=api_key)
+    # Force stable v1 endpoint — avoids 'User location not supported' on some cloud IPs
+    from google.genai import types as _gt
+    _llm = genai.Client(
+        api_key=api_key,
+        http_options=_gt.HttpOptions(api_version="v1"),
+    )
     print(f"[resources] Loaded {len(_metadata)} items, index dim={_index.d}", file=sys.stderr)
 
 
